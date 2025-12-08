@@ -32,6 +32,21 @@
 #pragma once
 
 namespace cute {
+namespace detail {
+template <class T>
+struct slm_scalar_type {
+  using type = T;
+};
+
+template <>
+struct slm_scalar_type<cutlass::bfloat16_t> {
+  using type = sycl::ext::oneapi::bfloat16;
+};
+
+template <class T>
+using slm_scalar_type_t = typename slm_scalar_type<T>::type;
+
+} // namespace detail
 
 /* Flat copies */
 template <class SrcEngine, class SrcLayout,
@@ -42,12 +57,18 @@ copy_block_r2s(Tensor<SrcEngine, SrcLayout> const& src,
                Tensor<DstEngine, DstLayout>      & dst)
 {
   static_assert(is_rmem_v<SrcEngine> && is_smem_v<DstEngine>, "Expected rmem->smem copy");
+  using dtype = typename SrcEngine::value_type;
+  using slm_dtype = detail::slm_scalar_type_t<dtype>;
+  // using slm_dtype = uint64_t;
+  auto atom_r2s = Copy_Atom<XE_1D_STSM<slm_dtype>, slm_dtype>{};    // TODO: larger block messages
+  // auto src_new = recast<slm_dtype>(src);
+  // auto dst_new = recast<slm_dtype>(dst);
+  auto src_new = src;
+  auto dst_new = dst;
 
-  auto atom_r2s = Copy_Atom<XE_1D_STSM<float>, float>{};    // TODO: larger block messages
-
-  auto atom_shape = make_shape(_1{}, size(src));
-  auto src_v = src.compose(make_layout(atom_shape));
-  auto dst_v = dst.compose(make_layout(atom_shape, Stride<_0, _16>{}));
+  auto atom_shape = make_shape(_1{}, size(src_new));
+  auto src_v = src_new.compose(make_layout(atom_shape));
+  auto dst_v = dst_new.compose(make_layout(atom_shape, Stride<_0, intel::_SGSize>{}));
 
   copy(atom_r2s, src_v, dst_v);
 }
@@ -60,12 +81,21 @@ copy_block_s2r(Tensor<SrcEngine, SrcLayout> const& src,
                Tensor<DstEngine, DstLayout>      & dst)
 {
   static_assert(is_smem_v<SrcEngine> && is_rmem_v<DstEngine>, "Expected smem->rmem copy");
-
-  auto atom_s2r = Copy_Atom<XE_1D_LDSM<float>, float>{};
-
-  auto atom_shape = make_shape(_1{}, size(dst));
-  auto src_v = src.compose(make_layout(atom_shape, Stride<_0, _16>{}));
-  auto dst_v = dst.compose(make_layout(atom_shape));
+  using dtype = typename SrcEngine::value_type;
+  using slm_dtype = detail::slm_scalar_type_t<dtype>;
+  // using slm_dtype = uint64_t;
+  
+  auto atom_s2r = Copy_Atom<XE_1D_LDSM<slm_dtype>, slm_dtype>{};
+  // auto src_new = recast<slm_dtype>(src);
+  // auto dst_new = recast<slm_dtype>(dst);
+  auto src_new = src;
+  auto dst_new = dst;
+  
+  auto atom_shape = make_shape(_1{}, size(dst_new));
+  // auto atom_shape = make_shape(_1{}, size(dst));
+  // auto src_v = src_new.compose(make_layout(atom_shape));
+  auto src_v = src_new.compose(make_layout(atom_shape, Stride<_0, intel::_SGSize>{}));
+  auto dst_v = dst_new.compose(make_layout(atom_shape));
 
   copy(atom_s2r, src_v, dst_v);
 }
@@ -83,8 +113,10 @@ copy_block_r2s(SubgroupTensor<SrcEngine, SrcLayout, SrcCoordLayout> const& src,
 
   static_assert(is_rmem_v<SrcEngine> && is_smem_v<DstEngine>, "Expected rmem->smem copy");
   static_assert(sizeof_bits_v<typename SrcEngine::value_type> == 32, "Only 32-bit data supported");
+  using dtype = typename SrcEngine::value_type;
+  using slm_dtype = detail::slm_scalar_type_t<dtype>;
 
-  auto atom_r2s = Copy_Atom<XE_1D_STSM<float>, float>{};    // TODO: larger block messages
+  auto atom_r2s = Copy_Atom<XE_1D_STSM<slm_dtype>, slm_dtype>{};    // TODO: larger block messages
 
   auto atom_shape = make_shape(_1{}, size(SrcLayout{}));
 
@@ -109,8 +141,10 @@ copy_block_s2r(Tensor<SrcEngine, SrcLayout>                         const& src,
 
   static_assert(is_smem_v<SrcEngine> && is_rmem_v<DstEngine>, "Expected smem->rmem copy");
   static_assert(sizeof_bits_v<typename SrcEngine::value_type> == 32, "Only 32-bit data supported");
+  using dtype = typename SrcEngine::value_type;
+  using slm_dtype = detail::slm_scalar_type_t<dtype>;
 
-  auto atom_s2r = Copy_Atom<XE_1D_LDSM<float>, float>{};
+  auto atom_s2r = Copy_Atom<XE_1D_LDSM<slm_dtype>, slm_dtype>{};
 
   auto atom_shape = make_shape(_1{}, size(DstLayout{}));
 

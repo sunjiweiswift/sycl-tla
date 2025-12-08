@@ -86,6 +86,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
   using TileShapeQK = decltype(TiledMMAQK{}.tile_mnk());
   using TileShapePV = decltype(TiledMMAPV{}.tile_mnk());
   static constexpr int VTiles = VTiles_;
+  static constexpr int HeadSizeVO = VTiles * get<1>(TileShapePV{});
   using SubgroupLayoutQK = decltype(TiledMMAQK{}.get_atom_layout_mnk());
   using SGPerWG = decltype(product(take<1,4>(shape(typename TiledMMAQK::ThrLayoutVMNK{}))));
 
@@ -125,6 +126,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
   using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;     // (atom val,q',v',VV)
   using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
   using ElementA = typename TiledMMAPV::ValTypeD;
+  using ElementK = typename TiledMMAQK::ValTypeB;
 
   static constexpr bool CausalMask = CausalMask_;
 
@@ -137,15 +139,21 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
   using Params = Arguments;
 
   // SLM data
-  struct SharedStorage {};
+  struct SharedStorage {
+    cute::array<ElementK, get<1>(TileShapeQK{}) * 8* HeadSizeVO> k_preload;  // SLM for K preload
+  };
 
+private:
+  SharedStorage &shared;
+
+public:
   Params params;
 
   //
   // Methods
   //
 
-  FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloop(Params const &params_, SharedStorage &shared_) : params(params_), shared(shared_) {}
 
   static constexpr
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
@@ -178,6 +186,17 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
              int              discard_seq_coord) {
     using namespace sycl::ext::oneapi::this_work_item;
 
+      // using TiledCopyQ = conditional_t<is_void_v<TiledCopyQ_>, decltype(make_block_2d_copy_A(TiledMMAQK{}, TensorQ2D{})), TiledCopyQ_>;
+      if (thread(0,0)) {
+        print("TiledCopyQ: ");
+        print(TiledCopyQ{});
+        print("TiledCopyK: ");
+        print(TiledCopyK{});
+        print("\n");  
+        print(" TiledMMAQK{}: ");
+        print(TiledMMAQK{});
+        print("\n");
+      }
     // Short dimension names:
     //    q = sequence len dimension for Q
     //    k = sequence len dimension for K
@@ -270,21 +289,42 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
 
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
-
+    auto tSrKPreLoad = make_tensor(make_smem_ptr<ElementK>(&shared.k_preload), make_shape(size(tSrK.layout()), 16 * 8,size<4>(tKgK)));
+    // auto tSrKPreLoad = make_tensor(make_smem_ptr<ElementK>(&shared.k_preload), make_shape(size(tSrK.tv_layout()), size<4>(tKgK)));
+    // clear(tSrKPreLoad);
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1; K++) {
       /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
-
+      // barrier_arrive(ScopeWorkgroup);
+      // Preload K for the first block
+      for (int D = 0; D < size<4>(tKgK); D++) {
+        copy(copy_k, tKgK(_,_,_,K,D), tKrK);
+        reorder(tKrK, tSrK);
+        // if (thr_id < 16) {
+          // copy_block_r2s(tSrK, tSrKPreLoad(_,D));
+          barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+          for (int i = 0; i < tSrK.size(); i++) {
+            tSrKPreLoad(i, thr_id, D) = tSrK(i);
+          }
+          barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+          // }
+          
+        }
       /* GEMM 1: S = K * Q */
       clear(tSrS);    /* TODO: fuse w/ initial gemm call */
+      // CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
+        barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+        // copy_block_s2r(tSrKPreLoad(_,D), tSrK);
+        for (int i = 0; i < tSrK.size(); i++) {
+          tSrK(i) = tSrKPreLoad(i, thr_id, D);
+        }
+        barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
         copy(copy_q, tQgQ(_,_,_,D),   tQrQ);
-        copy(copy_k, tKgK(_,_,_,K,D), tKrK);
-
+        // copy(copy_k, tKgK(_,_,_,K,D), tKrK);
+        
         reorder(tQrQ, tSrQ);
-        reorder(tKrK, tSrK);
-
+        // reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
@@ -335,11 +375,11 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
       }
 
       /* K prefetch */
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        prefetch(prefetch_k, pKgK(_,_,_,K+Stages,D));
-      }
+      // for (int D = 0; D < size<4>(pKgK); D++) {
+      //   prefetch(prefetch_k, pKgK(_,_,_,K+Stages,D));
+      // }
 
-      barrier_wait(ScopeWorkgroup);
+      // barrier_wait(ScopeWorkgroup);
     }
   }
 
