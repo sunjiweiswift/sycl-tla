@@ -88,14 +88,18 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
   static constexpr int VTiles = VTiles_;
   using SubgroupLayoutQK = decltype(TiledMMAQK{}.get_atom_layout_mnk());
   using SGPerWG = decltype(product(take<1,4>(shape(typename TiledMMAQK::ThrLayoutVMNK{}))));
+  static constexpr int HeadSizeVO = VTiles * get<1>(TileShapePV{});
+  static constexpr int QGroupSize = 2;
 
   using TensorQ = TensorQ_;
   using TensorK = TensorK_;
   using TensorV = TensorV_;
 
   using TensorQ2D = decltype(TensorQ_{}(append<rank_v<TensorQ_>>(make_coord(_,_),0)));
+  using TensorQ3D = decltype(TensorQ_{}(append<rank_v<TensorQ_>>(make_coord(_,_,_),0)));
   using TensorK2D = decltype(TensorK_{}(append<rank_v<TensorK_>>(make_coord(_,_),0)));
   using TensorV2D = decltype(TensorV_{}(append<rank_v<TensorV_>>(make_coord(_,_),0)));
+
 
   using TiledCopyQ = conditional_t<is_void_v<TiledCopyQ_>, decltype(make_block_2d_copy_A(TiledMMAQK{}, TensorQ2D{})), TiledCopyQ_>;
   using TiledCopyK = conditional_t<is_void_v<TiledCopyK_>, decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK2D{})), TiledCopyK_>;
@@ -119,7 +123,23 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
 
   using FragS = FragC<TiledMMAQK>;
   using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
+  using ElementQ = typename TiledMMAQK::ValTypeA;
+  using ElementK = typename TiledMMAQK::ValTypeB;
   using ElementS = typename TiledMMAQK::ValTypeD;
+
+  using PackTypeQ = cutlass::AlignedArray<ElementQ, (get<0>(TileShapeQK{}) * get<2>(TileShapeQK{})) / (SGPerWG{} * intel::sg_size)>;
+  using PackTypeK = cutlass::AlignedArray<ElementK, product(take<1, 3>(TileShapeQK{})) / (SGPerWG{} * intel::sg_size)>;
+  using PackTypeS = cutlass::AlignedArray<ElementS, product(take<0, 2>(TileShapeQK{})) / (SGPerWG{} * intel::sg_size)>;
+
+  using TiledCopyQSmem = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeQ>, ElementQ>{},
+                                                 Layout<Shape<_1, _16>, Stride<_0, _1>>{},
+                                                 Layout<Shape<Int<PackTypeQ::kElements>, _1>, Stride<_1, _0>>{}));
+  using TiledCopyKSmem = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeK>, ElementK>{},
+                                                 Layout<Shape<_1, _16>, Stride<_0, _1>>{},
+                                                 Layout<Shape<Int<PackTypeK::kElements>, _1>, Stride<_1, _0>>{}));
+  using TiledCopySSmem = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeS>, ElementS>{},
+                                                 Layout<Shape<_1, _16>, Stride<_0, _1>>{},
+                                                 Layout<Shape<Int<PackTypeS::kElements>, _1>, Stride<_1, _0>>{}));
 
   using SingleFragA = FragC<TiledMMAPV>;                          // (atom val,q',v')
   using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;     // (atom val,q',v',VV)
@@ -205,22 +225,33 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     TiledCopyQ copy_q{Q_2D};
     TiledCopyK copy_k{K_2D};
     TiledCopyV copy_v{V_2D};
-
+    
+    TiledCopyQSmem copy_q_smem =  make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeQ>, ElementQ>{},
+                                                 Layout<Shape<_1, _16>, Stride<_0, _1>>{},
+                                                 Layout<Shape<Int<PackTypeQ::kElements>, _1>, Stride<_1, _0>>{});
+    TiledCopyQSmem copy_k_smem{};
+    TiledCopyQSmem copy_s_smem{};
+    
     /* Create MMAs */
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
-
+    
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
     auto thr_copy_q = copy_q.get_slice(thr_id);
     auto thr_copy_k = copy_k.get_slice(thr_id);
     auto thr_copy_v = copy_v.get_slice(thr_id);
+    auto thr_copy_qsmem = copy_q_smem.get_slice(thr_id % intel::sg_size);
+    auto thr_copy_ksmem = copy_k_smem.get_slice(thr_id % intel::sg_size);
+    auto thr_copy_ssmem = copy_s_smem.get_slice(thr_id % intel::sg_size);
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
-
+    
     /* Partition coordinate tensors for copy */
     auto tQgQ = thr_copy_q.partition_S(gQ);                // (atom_val,q',d',D)
     auto tKgK = thr_copy_k.partition_S(gK);                // (atom_val,k',d',K,D)
     auto tVgV = thr_copy_v.partition_S(gV_split);          // (atom_val,v',k',VV,K)
+    auto tQsQLoad = thr_copy_qsmem.partition_S(gQ);
+    auto tQsQStore = thr_copy_qsmem.partition_D(gQ);
 
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
@@ -244,7 +275,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
     auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
     auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV);
-
+              
     // ------
     // Kernel
     // ------
@@ -280,6 +311,17 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
       clear(tSrS);    /* TODO: fuse w/ initial gemm call */
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_,_,_,D),   tQrQ);
+        if (thread(0,0)) {
+          print("\n tQgQ \n");
+          print(tQgQ);
+          print("\n copy_q \n");
+          print(copy_q);
+          print("\n tQsQStore \n");
+          print(tQsQStore);
+          print("\n copy_q_smem \n");
+          print(copy_q_smem);
+        }
+        // copy(copy_q_smem, tQrQ, tQsQStore);
         copy(copy_k, tKgK(_,_,_,K,D), tKrK);
 
         reorder(tQrQ, tSrQ);

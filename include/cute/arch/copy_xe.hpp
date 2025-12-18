@@ -76,8 +76,8 @@ struct XE_1D_LDSM {
     #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
       CUTE_STATIC_ASSERT(sizeof(S_) == sizeof(S));
       uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&src);
-      int thr_id_in_subgroup = int(ThreadIdxX()) % intel::sg_size;
-      smem_int_ptr += thr_id_in_subgroup * sizeof(D);
+      int tid_in_sg = int(ThreadIdxX()) % intel::sg_size;
+      smem_int_ptr += tid_in_sg * sizeof(D);
       auto& data_vec = *reinterpret_cast<StorageT *>(&dst);
       if constexpr (N_d32 > 1) {
         asm volatile(
@@ -171,8 +171,8 @@ struct XE_1D_STSM {
   copy(S_ const& src, D_ & dst) {
     #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
           uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&dst);
-          int thr_id_in_subgroup = int(ThreadIdxX()) % intel::sg_size;
-          smem_int_ptr += thr_id_in_subgroup * sizeof(S);
+          int tid_in_sg = int(ThreadIdxX()) % intel::sg_size;
+          smem_int_ptr += tid_in_sg * sizeof(S);
           auto& data_vec = *reinterpret_cast<StorageT const*>(&src);
           if constexpr (N_d32 > 1) {
             asm volatile(
