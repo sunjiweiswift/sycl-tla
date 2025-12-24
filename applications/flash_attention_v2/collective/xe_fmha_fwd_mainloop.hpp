@@ -89,7 +89,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
   using SubgroupLayoutQK = decltype(TiledMMAQK{}.get_atom_layout_mnk());
   using SGPerWG = decltype(product(take<1,4>(shape(typename TiledMMAQK::ThrLayoutVMNK{}))));
   static constexpr int HeadSizeVO = VTiles * get<1>(TileShapePV{});
-  static constexpr int QGroupSize = 2;
+  static constexpr int QGroupSize = 1;
 
   using TensorQ = TensorQ_;
   using TensorK = TensorK_;
@@ -126,15 +126,16 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
   using ElementQ = typename TiledMMAQK::ValTypeA;
   using ElementK = typename TiledMMAQK::ValTypeB;
   using ElementS = typename TiledMMAQK::ValTypeD;
-
+U128
   using PackTypeQ = cutlass::AlignedArray<ElementQ, (get<0>(TileShapeQK{}) * get<2>(TileShapeQK{})) / (SGPerWG{} * intel::sg_size)>;
   using PackTypeK = cutlass::AlignedArray<ElementK, product(take<1, 3>(TileShapeQK{})) / (SGPerWG{} * intel::sg_size)>;
   using PackTypeS = cutlass::AlignedArray<ElementS, product(take<0, 2>(TileShapeQK{})) / (SGPerWG{} * intel::sg_size)>;
 
-  using TiledCopyQSmem = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeQ>, ElementQ>{},
+  using TiledCopyQSmem = decltype(make_tiled_copy(Copy_Atom<XE_1D_LDSM<PackTypeQ>, ElementQ>{},
                                                  Layout<Shape<_1, _16>, Stride<_0, _1>>{},
-                                                 Layout<Shape<Int<PackTypeQ::kElements>, _1>, Stride<_1, _0>>{}));
-  using TiledCopyKSmem = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeK>, ElementK>{},
+                                                 Layout< size(u128) / sizeof(bf16)>, _1>, Stride<_1, _0>>{}));
+  
+                                                 using TiledCopyKSmem = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeK>, ElementK>{},
                                                  Layout<Shape<_1, _16>, Stride<_0, _1>>{},
                                                  Layout<Shape<Int<PackTypeK::kElements>, _1>, Stride<_1, _0>>{}));
   using TiledCopySSmem = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeS>, ElementS>{},
@@ -157,15 +158,26 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
   using Params = Arguments;
 
   // SLM data
-  struct SharedStorage {};
+  struct SharedStorage {
+    // Allocate shared memory for QxK tile
+    // cute::array<ElementS, QGroupSize * product(take<0, 2>(TileShapeQK{}))> s_smem;
+    cute::array<ElementQ, QGroupSize * get<0>(TileShapeQK{}) * HeadSizeVO> q_preload; // Assum head_size_qk == head_size_vo
+    // cute::array<ElementK, get<1>(TileShapeQK{}) * HeadSizeVO> k_preload;              // Assum head_size_qk == head_size_vo
 
+    // cute::array<ElementS, QGroupSize * product(take<0, 2>(TileShapeQK{}))> s_slm;
+    // cute::array<ElementS, QGroupSize * get<0>(TileShapeQK{})> sum_slm;
+    // cute::array<ElementS, QGroupSize * get<0>(TileShapeQK{})> max_slm;
+  };
+private:
+  SharedStorage &shared;
+
+public:
   Params params;
-
   //
   // Methods
   //
 
-  FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloop(Params const &params_, SharedStorage &shared_) : params(params_), shared(shared_) {}
 
   static constexpr
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
@@ -225,10 +237,11 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     TiledCopyQ copy_q{Q_2D};
     TiledCopyK copy_k{K_2D};
     TiledCopyV copy_v{V_2D};
-    
-    TiledCopyQSmem copy_q_smem =  make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeQ>, ElementQ>{},
-                                                 Layout<Shape<_1, _16>, Stride<_0, _1>>{},
-                                                 Layout<Shape<Int<PackTypeQ::kElements>, _1>, Stride<_1, _0>>{});
+    // PackTypeQ = 
+    // TiledCopyQSmem copy_q_smem =  make_tiled_copy(Copy_Atom<UniversalCopy<PackTypeQ>, ElementQ>{},
+    //                                              Layout<Shape<_1, Int<intel::sg_size>>, Stride<_0, _1>>{},
+    //                                              Layout<Shape<Int<PackTypeQ::kElements>, _1>, Stride<_1, _0>>{});
+    TiledCopyQSmem copy_q_smem{};
     TiledCopyQSmem copy_k_smem{};
     TiledCopyQSmem copy_s_smem{};
     
@@ -241,6 +254,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     auto thr_copy_k = copy_k.get_slice(thr_id);
     auto thr_copy_v = copy_v.get_slice(thr_id);
     auto thr_copy_qsmem = copy_q_smem.get_slice(thr_id % intel::sg_size);
+    // auto thr_copy_qsmem1 = copy_q_smem.get_slice(thr_id);
+   
     auto thr_copy_ksmem = copy_k_smem.get_slice(thr_id % intel::sg_size);
     auto thr_copy_ssmem = copy_s_smem.get_slice(thr_id % intel::sg_size);
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
@@ -250,8 +265,10 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     auto tQgQ = thr_copy_q.partition_S(gQ);                // (atom_val,q',d',D)
     auto tKgK = thr_copy_k.partition_S(gK);                // (atom_val,k',d',K,D)
     auto tVgV = thr_copy_v.partition_S(gV_split);          // (atom_val,v',k',VV,K)
-    auto tQsQLoad = thr_copy_qsmem.partition_S(gQ);
-    auto tQsQStore = thr_copy_qsmem.partition_D(gQ);
+    auto sQ = make_tensor(make_smem_ptr<ElementQ>(&shared.q_preload), make_shape(PackTypeQ::kElements, intel::sg_size, size<4>(tKgK), SGPerWG{}, QGroupSize));
+
+    auto tQsQLoad = thr_copy_qsmem.partition_S(sQ);
+    auto tQsQStore = thr_copy_qsmem.partition_D(sQ);
 
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
@@ -279,7 +296,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     // ------
     // Kernel
     // ------
-
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    // int sg_id = sg.get_group_id()[0];
+    auto sg_id = sg.get_group_linear_id();
     /* Initialization steps for first block: Q/K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
     if (blk_k0 == 0) {
@@ -305,28 +324,51 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1; K++) {
       /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
+      // barrier_arrive(ScopeWorkgroup);
+      
 
       /* GEMM 1: S = K * Q */
       clear(tSrS);    /* TODO: fuse w/ initial gemm call */
       for (int D = 0; D < size<4>(tKgK); D++) {
+        // if (thread(0,0)) {
+          //   print("\n tQgQ \n");
+          //   print(tQgQ);
+          //   print("\n copy_q \n");
+          //   print(copy_q);
+          //   print("\n tQsQLoad \n");
+          //   print(tQsQLoad);
+          //   print("\n tQsQStore \n");
+        //   print(tQsQStore);
+        //   print("\n copy_q_smem \n");
+        //   print(copy_q_smem);
+        // }
         copy(copy_q, tQgQ(_,_,_,D),   tQrQ);
-        if (thread(0,0)) {
-          print("\n tQgQ \n");
-          print(tQgQ);
-          print("\n copy_q \n");
-          print(copy_q);
-          print("\n tQsQStore \n");
-          print(tQsQStore);
-          print("\n copy_q_smem \n");
-          print(copy_q_smem);
-        }
-        // copy(copy_q_smem, tQrQ, tQsQStore);
         copy(copy_k, tKgK(_,_,_,K,D), tKrK);
 
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
+        copy(copy_q_smem, tSrQ, tQsQStore(_,_,_,D,sg_id,0));//tSrQ->tQsQStore
 
+        barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+        barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+        
+        if (thread(1,0)) {
+          print("\n before tSrQ %d \n", sg_id);
+          print_tensor(tSrQ);
+          
+        }
+        clear(tSrQ);
+        // copy(copy_q_smem, tQsQLoad(_,_,_,_,sg_id,0), tSrQ);
+        copy(copy_q_smem, tQsQLoad(_,_,_,D,sg_id,0), tSrQ);
+
+        barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+        barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+        
+        
+        if (thread(1,0)) {
+          print("\n after tSrQ %d \n", sg_id);
+          print_tensor(tSrQ);
+        }
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
@@ -381,7 +423,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
         prefetch(prefetch_k, pKgK(_,_,_,K+Stages,D));
       }
 
-      barrier_wait(ScopeWorkgroup);
+      // barrier_wait(ScopeWorkgroup);
     }
   }
 
