@@ -271,6 +271,8 @@ public:
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
+    auto store_tSrQ = thr_store_q_smem.retile_S(tSrQ);
+    auto load_tSrQ = thr_load_q_smem.retile_D(tSrQ);
 
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
@@ -314,10 +316,10 @@ public:
       for (int D = 0; D < VTiles; ++D) {
         copy(copy_q, tQgQ(_,_,_,D), tQrQ);
         reorder(tQrQ, tSrQ);
-        auto store_tSrQ = thr_store_q_smem.retile_S(tSrQ);
         copy(store_q_smem, store_tSrQ, tQsQStore(_,_,_,D,0));
       }
-
+        barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+        barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
       clear(tArA);
       fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
       clear(tA_sum);
@@ -330,7 +332,7 @@ public:
     for (int K = blk_k0; K < blk_k1; K++) {
       /* Split barrier to keep threads together */
       // barrier_arrive(ScopeWorkgroup);
-      
+      barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
 
       /* GEMM 1: S = K * Q */
       clear(tSrS);    /* TODO: fuse w/ initial gemm call */
@@ -343,11 +345,9 @@ public:
         // reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         /* smem -> reg */
-        auto load_tSrQ = thr_load_q_smem.retile_D(tSrQ);
         copy(load_q_smem, tQsQLoad(_,_,_,D,0), load_tSrQ);
 
-        barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
-        barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+
         
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
@@ -404,6 +404,7 @@ public:
       }
 
       // barrier_wait(ScopeWorkgroup);
+      barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
     }
   }
 
