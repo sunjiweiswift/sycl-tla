@@ -706,7 +706,9 @@ struct FMHAConfig {
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHAKernel = conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
-      cutlass::fmha::kernel::XeFMHAFwdDynamicSplitKernel<
+      // cutlass::fmha::kernel::XeFMHAFwdDynamicSplitKernel<
+      //   ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
+      cutlass::fmha::kernel::XeFMHAFwdKernel<
         ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
         cutlass::fmha::kernel::XeFMHAFwdKernel<
         ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>
@@ -722,7 +724,8 @@ struct FMHAConfig {
     if (options.varlen) {
       return run<true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else {
-      return persistent ? run<false, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>(options) :
+      return persistent ?   run<false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options) :
+      // return persistent ? run<false, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>(options) :
               run<false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     }
   }

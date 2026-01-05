@@ -62,7 +62,8 @@ struct XeFHMAIndividualTileScheduler {
 
     dim3 grid(size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),     // V
               size(ceil_div(shape.seq_len_qo,   get<0>(tile_shape))),     // Q
-              size(shape.batch * shape.num_heads_q));                     // (h,b) -- split later
+              size(shape.batch * shape.num_heads_kv));                     // (h,b) -- split later
+              // size(shape.batch * shape.num_heads_q));                     // (h,b) -- split later
     return Params{grid, {shape.num_heads_q}};
   }
 
@@ -80,9 +81,9 @@ struct XeFHMAIndividualTileScheduler {
   auto get_block_coord() {
     using namespace cute;
     int idx_b = BlockIdxZ();
-    int head;
-    params.divmod_num_heads(idx_b, head, idx_b);
-    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b);
+    int head_kv;
+    params.divmod_num_heads(idx_b, head_kv, idx_b);
+    return make_coord(BlockIdxY(), BlockIdxX(), head_kv, idx_b);
   }
 
   CUTLASS_DEVICE
