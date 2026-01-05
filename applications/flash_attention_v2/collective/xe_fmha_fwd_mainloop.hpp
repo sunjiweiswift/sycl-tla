@@ -168,7 +168,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
     cute::array<ElementQ, QGroupSize * get<0>(TileShapeQK{}) * HeadSizeVO> q_preload; // Assum head_size_qk == head_size_vo
     // cute::array<ElementK, get<1>(TileShapeQK{}) * HeadSizeVO> k_preload;              // Assum head_size_qk == head_size_vo
 
-    // cute::array<ElementS, QGroupSize * product(take<0, 2>(TileShapeQK{}))> s_slm;
+    cute::array<ElementS, QGroupSize * product(take<0, 2>(TileShapeQK{}))> s_slm;
     // cute::array<ElementS, QGroupSize * get<0>(TileShapeQK{})> sum_slm;
     // cute::array<ElementS, QGroupSize * get<0>(TileShapeQK{})> max_slm;
   };
@@ -224,6 +224,7 @@ public:
     // Primed letters (q', k', ...) refer to atom block indices.
 
     auto tile_shape_v = make_shape(get<1>(TileShapePV{}) * C<VTiles>{}, get<2>(TileShapePV{}));
+    auto tile_shape_QK = make_shape(get<0>(TileShapeQK{}), get<1>(TileShapeQK{}), C<VTiles>{} * get<2>(TileShapeQK{}));
 
     /* Create proxy coordinate tensors for Q/K/P/V */
     Tensor cQ = make_identity_tensor(Q_2D.shape());             // (q,d)
@@ -234,6 +235,7 @@ public:
     /* Partition global tensors into workgroup tiles */
     Tensor gQ       = local_tile(cQ, TileShapeQK{}, append(blk_qv,_),             Step<_1,X,_1>{});   // (q,d,D)
     Tensor gK       = local_tile(cK, TileShapeQK{}, make_coord(_,_,_),            Step<X,_1,_1>{});   // (k,d,K,D)
+    Tensor gK_full  = local_tile(cK, tile_shape_QK, make_coord(_,_,_),            Step<X,_1,_1>{});   // (k,d,K,D)
     Tensor gV       = local_tile(cV, tile_shape_v,  make_coord(get<1>(blk_qv),_));                    // (v,k,K)
     Tensor gV_split = local_tile(gV, TileShapePV{}, make_coord(_,_,0),            Step<X,_1,_1>{});   // (v,k,VV,K)
 
@@ -271,12 +273,20 @@ public:
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
+    // auto tSrQ_fullD = thr_mma_qk.partition_sg_fragment_A(gQ_fullD(_,_,0));
     auto store_tSrQ = thr_store_q_smem.retile_S(tSrQ);
     auto load_tSrQ = thr_load_q_smem.retile_D(tSrQ);
 
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
-
+    auto tSrK_full = thr_mma_qk.partition_sg_fragment_B(gK_full(_,_,0,0));
+    
+    if (thread(0, 0)) {
+      print("\n tSrK_full \n");
+      print(tSrK_full);
+      print("\n tSrK \n");
+      print(tSrK);
+    }
     auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
 
@@ -346,9 +356,6 @@ public:
         reorder(tKrK, tSrK);
         /* smem -> reg */
         copy(load_q_smem, tQsQLoad(_,_,_,D,0), load_tSrQ);
-
-
-        
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
