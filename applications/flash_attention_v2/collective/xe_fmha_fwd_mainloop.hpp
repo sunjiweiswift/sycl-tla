@@ -276,23 +276,22 @@ public:
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
-    // auto tSrQ_fullD = thr_mma_qk.partition_sg_fragment_A(gQ_fullD(_,_,0));
     auto store_tSrQ = thr_store_q_smem.retile_S(tSrQ);
     auto load_tSrQ = thr_load_q_smem.retile_D(tSrQ);
 
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
     
-    using SingletSrK = decltype(thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0)));   
-    using SingletKrK = decltype(thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0)));   
-    using SingletSrK_tv_layout = decltype(SingletSrK{}.tv_layout());   
-    using SingletKrK_tv_layout = decltype(SingletKrK{}.tv_layout());   
-    SingletSrK_tv_layout  tSrk_tv_layout;
-    SingletKrK_tv_layout  tKrk_tv_layout;
-    using tSrKFull = expand_sg_fragment_t<SingletSrK, 1, HeadDimTiles>; 
-    using tKrKFull = expand_sg_fragment_t<SingletKrK, 1, HeadDimTiles>; 
-    tSrKFull tSrK1;
-    tKrKFull tKrK1;
+    // using SingletSrK = decltype(thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0)));   
+    // using SingletKrK = decltype(thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0)));   
+    // using SingletSrK_tv_layout = decltype(SingletSrK{}.tv_layout());   
+    // using SingletKrK_tv_layout = decltype(SingletKrK{}.tv_layout());   
+    // SingletSrK_tv_layout  tSrk_tv_layout;
+    // SingletKrK_tv_layout  tKrk_tv_layout;
+    // using tSrKFull = expand_sg_fragment_t<SingletSrK, 1, HeadDimTiles>; 
+    // using tKrKFull = expand_sg_fragment_t<SingletKrK, 1, HeadDimTiles>; 
+    // tSrKFull tSrK1;
+    // tKrKFull tKrK1;
     
     auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
@@ -357,24 +356,21 @@ public:
       for (int q = 0; q < QGroupSize; q++) {
         /* GEMM 1: S = K * Q */
         clear(tSrS);    /* TODO: fuse w/ initial gemm call */
-          copy(copy_k, tKgK(_,_,_,K,_), tKrK1);
-          reorder(tKrK1, tSrK1);        
-        // for (int D = 0; D < size<4>(tKgK); D++) {
-        // CUTLASS_PRAGMA_UNROLL
-        // for (int D = 0; D < VTiles; D++) {
-        //   // copy(copy_q, tQgQ(_,_,_,D),   tQrQ);
-        //   copy(copy_k, tKgK(_,_,_,K,D), tKrK);
-          
-        //   // reorder(tQrQ, tSrQ);
-        //   // reorder(tKrK, tSrK);
-        //   auto tSrK2 = make_subgroup_tensor(tSrK1(_,_,_,D), tSrk_tv_layout);
-        //   reorder(tKrK, tSrK2);
-        // }
         CUTLASS_PRAGMA_UNROLL
-        for (int D = 0; D < VTiles; D++) {
-        //   /* smem -> reg */
-          auto tSrK = make_subgroup_tensor(tSrK1(_,_,_,D), tSrk_tv_layout);
-          copy(load_q_smem, tQsQLoad(_,_,_,D,q), load_tSrQ);
+        for (int D = 0; D < HeadDimTiles; D++) {
+          //   // copy(copy_q, tQgQ(_,_,_,D),   tQrQ);
+          copy(copy_k, tKgK(_,_,_,K,D), tKrK);
+          reorder(tKrK, tSrK);
+          // auto tSrK2 = make_subgroup_tensor(tSrK1(_,_,_,D), tSrk_tv_layout);
+          // auto tKrK2 = make_subgroup_tensor(tKrK1(_,_,_,D), tSrk_tv_layout);
+          // reorder(tKrK2, tSrK);
+          // }
+          // CUTLASS_PRAGMA_UNROLL
+          // for (int D = 0; D < HeadDimTiles; D++) {
+            // //   /* smem -> reg */
+            //   // auto tSrK = make_subgroup_tensor(tSrK1(_,_,_,D), tSrk_tv_layout);
+            //   auto tSrk = tSrK1(_,_,_,D);
+          copy(load_q_smem, tQsQLoad(_, _, _, D, q), load_tSrQ);
           cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
         }
       
