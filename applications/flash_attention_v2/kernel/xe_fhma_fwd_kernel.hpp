@@ -88,8 +88,8 @@ public:
 
   using SGPerWG = typename CollectiveMainloop::SGPerWG;
 
-  using FragA = typename CollectiveMainloop::FragA;
-  using FragARow = typename CollectiveMainloop::FragARow;
+  using FragO = typename CollectiveMainloop::FragO;
+  using FragORow = typename CollectiveMainloop::FragORow;
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -257,13 +257,11 @@ public:
 
 
       // O accumulator types
-      FragA tArA;
-      FragARow tA_max, tA_sum;
-      auto tArA_slm = make_tensor(make_smem_ptr<typename FragA::element_type>(&shared_storage.mainloop.s_slm), make_shape(size(FragA{}.shape())* intel::sg_size, SGPerWG{}, QGroupSize));
-      // auto tA_max_slm = make_tensor(make_smem_ptr<typename FragARow::element_type>(&shared_storage.mainloop.max_slm), make_shape(size(FragARow{}.shape()) , intel::sg_size* SGPerWG{}, QGroupSize));
-      // auto tA_sum_slm = make_tensor(make_smem_ptr<typename FragARow::element_type>(&shared_storage.mainloop.sum_slm), make_shape(size(FragARow{}.shape()) , intel::sg_size* SGPerWG{}, QGroupSize));
-
-
+      FragO tArA;
+      FragORow tA_max, tA_sum;
+      auto tArA_slm = make_tensor(make_smem_ptr<typename FragO::element_type>(&shared_storage.mainloop.s_slm), make_shape(size(FragO{}.shape())* intel::sg_size, SGPerWG{}, QGroupSize));
+      // auto tA_max_slm = make_tensor(make_smem_ptr<typename FragORow::element_type>(&shared_storage.mainloop.max_slm), make_shape(size(FragORow{}.shape()) , intel::sg_size* SGPerWG{}, QGroupSize));
+      // auto tA_sum_slm = make_tensor(make_smem_ptr<typename FragORow::element_type>(&shared_storage.mainloop.sum_slm), make_shape(size(FragORow{}.shape()) , intel::sg_size* SGPerWG{}, QGroupSize));
       // Main loop
       int l_coord = is_var_len ? 0 : idx_b;
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);

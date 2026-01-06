@@ -66,9 +66,9 @@ public:
   using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_,_),0)));
   using ElementO = typename TensorO_::value_type;
 
-  using FragA = typename CollectiveMainloop::FragA;
-  using FragARow = typename CollectiveMainloop::FragARow;
-  using ElementA = typename FragA::value_type;
+  using FragO = typename CollectiveMainloop::FragO;
+  using FragORow = typename CollectiveMainloop::FragORow;
+  using ElementA = typename FragO::value_type;
 
   // Split k-reduced tiles between participating subgroups.
   // Assumption: the A tile is contiguous.
@@ -80,7 +80,7 @@ public:
     return Int<(v_total_sg > v_avail_sg) ? cute::gcd(v_total_sg, v_avail_sg) : v_total_sg>{};
   }
 
-  using SGTileShapeA = decltype(atuple_coshape(FragA{}.tv_layout()));
+  using SGTileShapeA = decltype(atuple_coshape(FragO{}.tv_layout()));
   using ReduceSGQ = decltype(cute::gcd(get<0>(SGTileShapeA{}), ReduceK{}));
   using ReduceSGV = decltype(reduce_sg_v_helper());
   using ReduceSGLayout = decltype(make_identity_layout(Shape<ReduceSGQ, ReduceSGV>{}));
@@ -139,14 +139,14 @@ public:
   CUTLASS_DEVICE
   void
   operator()(TensorO2D const& O,        // Global O tensor: (q,v)
-             FragA          & tArA,     // O accumulator:   (q,v)
-             FragARow       & tA_max,   // Softmax row-wise max accumulator
-             FragARow       & tA_sum,   // Softmax row-wise sum accumulator
+             FragO          & tArA,     // O accumulator:   (q,v)
+             FragORow       & tA_max,   // Softmax row-wise max accumulator
+             FragORow       & tA_sum,   // Softmax row-wise sum accumulator
              QVCoord          blk_qv,   // WG tile indices: (q,v)
              int              thr_id) { // Work-item ID
 
     using namespace cute;
-    using ElementA = typename FragA::element_type;
+    using ElementA = typename FragO::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
     auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
@@ -182,12 +182,12 @@ public:
   // Reduce k-blocks of A and A_sum across WG, if needed.
   // Note that each k block has its own scale factor based on A_max,
   //   so A/A_sum contributions need to be rescaled to match.
-  template <typename FragA, typename FragARow>
+  template <typename FragO, typename FragORow>
   CUTLASS_DEVICE
   decltype(auto)
-  reduce_A(FragA        & tArA,     // O accumulator:   (q,v)
-           FragARow     & tA_max,   // Softmax row-wise max accumulator
-           FragARow     & tA_sum,   // Softmax row-wise sum accumulator
+  reduce_A(FragO        & tArA,     // O accumulator:   (q,v)
+           FragORow     & tA_max,   // Softmax row-wise max accumulator
+           FragORow     & tA_sum,   // Softmax row-wise sum accumulator
            int            thr_id) { // Work-item ID
 
     using namespace sycl::ext::oneapi::this_work_item;
