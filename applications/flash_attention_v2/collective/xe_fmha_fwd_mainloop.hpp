@@ -137,23 +137,30 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_,
   using ElementK = typename TiledMMAQK::ValTypeB;
   using ElementS = typename TiledMMAQK::ValTypeD;
 
-  using PackTypeQ = uint128_t;
-  static constexpr int PackQRatio = sizeof(PackTypeQ) / sizeof(ElementQ);
   static constexpr int QElemsPerThr = FragA<TiledMMAQK>{}.size();
+  static_assert(QElemsPerThr >= 2, "Flash Attention requires each thread to load/store more than 2 elements of Q from SLM.");
+  using PackTypeQ = conditional_t<(QElemsPerThr > 8), uint128_t,
+                                  conditional_t<(QElemsPerThr > 4), uint64_t, uint32_t>>;
+  static constexpr int PackQRatio = sizeof(PackTypeQ) / sizeof(ElementQ);
   using StoreTrait = Copy_Traits<XE_1D_STSM<
       PackTypeQ,
       typename uint_bit<sizeof_bits_v<ElementQ>>::type>>;
   using LoadTrait = Copy_Traits<XE_1D_LDSM<
       typename uint_bit<sizeof_bits_v<ElementQ>>::type,
       PackTypeQ>>;
+
+  using ThreadLayout = Layout<Shape<intel::_SGSize, SGPerWGM>, Stride<_1, intel::_SGSize>>;
+  using VecLayout = Layout<Shape<Int<PackQRatio>, Int<QElemsPerThr / PackQRatio>>, Stride<_1, Int<PackQRatio>>>;
+
   using TiledStoreQSmem = decltype(make_tiled_copy(
       Copy_Atom<StoreTrait, ElementQ>{},
-      Layout<Shape<intel::_SGSize, SGPerWG>, Stride<_1, intel::_SGSize>>{},
-      Layout<Shape<Int<PackQRatio>, Int<QElemsPerThr / PackQRatio>>, Stride<_1, Int<PackQRatio>>>{}));
+      ThreadLayout{},
+      VecLayout{}));
+
   using TiledLoadQSmem = decltype(make_tiled_copy(
       Copy_Atom<LoadTrait, ElementQ>{},
-      Layout<Shape<intel::_SGSize, SGPerWG>, Stride<_1, intel::_SGSize>>{},
-      Layout<Shape<Int<PackQRatio>, Int<QElemsPerThr / PackQRatio>>, Stride<_1, Int<PackQRatio>>>{}));
+      ThreadLayout{},
+      VecLayout{}));
 
   using SingleFragO = FragC<TiledMMAPV>;                          // (atom val,q',v')
   using FragO = expand_sg_fragment_t<SingleFragO, 1, VTiles>;     // (atom val,q',v',VV)
@@ -281,12 +288,12 @@ public:
     auto tQsQLoad = thr_load_q_smem.partition_S(sQ);
 
     /* Create register fragments for MMA and copies */
-    auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
+    // auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
     auto store_tSrQ = thr_store_q_smem.retile_S(tSrQ);
     auto load_tSrQ = thr_load_q_smem.retile_D(tSrQ);
 
-    auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
+    // auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
     
     // using SingletSrK = decltype(thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0)));   
@@ -324,6 +331,7 @@ public:
     /* Initialization steps for first block: Q/K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
     if (blk_k0 == 0) {
+      barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
       // for (int D = 0; D < size<3>(pQgQ); D++) {
       //   prefetch(prefetch_q, pQgQ(_,_,_,D));
       // }
@@ -335,7 +343,17 @@ public:
         for (int D = 0; D < HeadDimTiles; ++D) {
           copy(copy_q, tQgQ(_,_,_,D), tQrQ);
           reorder(tQrQ, tSrQ);
-          copy(store_q_smem, store_tSrQ, tQsQStore(_,_,_,D,q));
+          if (thread(0,0)) {
+            print("\n store_q_smem \n");
+            print(store_q_smem);
+            print("\n tSrQ \n");
+            print(tSrQ);
+            print("\n store_tSrQ \n");
+            print(store_tSrQ);
+            print("\n tQsQStore(_,_,_,D,q) \n");
+            print(tQsQStore(_,_,_,D,q));
+          }
+          // copy(store_q_smem, store_tSrQ, tQsQStore(_,_,_,D,q));
         }
       }
       for (int D = 0; D < size<4>(pKgK); D++) {
@@ -347,9 +365,8 @@ public:
       clear(tArA);
       fill(tA_max, cutlass::platform::numeric_limits<ElementO>::lowest());
       clear(tA_sum);
+      barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
     }
-    // barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
-    // barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
 
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
@@ -369,17 +386,17 @@ public:
         CUTLASS_PRAGMA_UNROLL
         for (int D = 0; D < HeadDimTiles; D++) {
           // copy(copy_q, tQgQ(_,_,_,D),   tQrQ);
-          copy(load_q_smem, tQsQLoad(_,_,_,D,q), load_tSrQ);
-          // auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
+          auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
           copy(copy_k, tKgK(_,_,_,K,D), tKrK);
           // reorder(tQrQ, tSrQ);
           reorder(tKrK, tSrK);
+          // copy(load_q_smem, tQsQLoad(_,_,_,D,q), load_tSrQ);
           // auto tSrK2 = make_subgroup_tensor(tSrK1(_,_,_,D), tSrk_tv_layout);
           // auto tKrK2 = make_subgroup_tensor(tKrK1(_,_,_,D), tSrk_tv_layout);
           // reorder(tKrK, tSrK2);
-        // }
-        // CUTLASS_PRAGMA_UNROLL
-        // for (int D = 0; D < HeadDimTiles; D++) {
+          // }
+          // CUTLASS_PRAGMA_UNROLL
+          // for (int D = 0; D < HeadDimTiles; D++) {
           //   /* smem -> reg */
           // auto tSrK = make_subgroup_tensor(tSrK1(_,_,_,D), tSrk_tv_layout);
           // auto tSrk = tSrK1(_,_,_,D);
