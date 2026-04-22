@@ -40,6 +40,8 @@
 #include "cute/atom/mma_atom.hpp"
 #include "fmha_fusion.hpp"
 
+#include <tuple>
+
 namespace cutlass::fmha {
 
 template <int Stages> class XeDefault {};   // Default FMHA mainloop, P in registers.
@@ -59,6 +61,7 @@ template <class DispatchPolicy_,
           class TiledMMAQK_,          // Tiling for Q*K GEMM
           class TiledMMAPV_,          // Tiling for P*V GEMM
           int VTiles_,                // # of tiles in V dimension
+          int HeadDimQK_,             // Compile-time Q/K head dimension for Q SLM staging
           class TensorQ_,             // Global Q/K/V tensors
           class TensorK_,
           class TensorV_,
@@ -77,13 +80,13 @@ struct FMHAFwdMainloop {
 
 template <int Stages,
           bool CausalMask_, bool CachedKV_, bool PagedKV_,
-          class TiledMMAQK_, class TiledMMAPV_, int VTiles_,
+          class TiledMMAQK_, class TiledMMAPV_, int VTiles_, int HeadDimQK_,
           class TensorQ_, class TensorK_, class TensorV_,
           class TensorK_cache_, class TensorV_cache_,
           class TiledCopyQ_, class TiledCopyK_, class TiledCopyV_,
           class TiledCopyK_cache_, class TiledCopyV_cache_>
 struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
-                       TiledMMAQK_, TiledMMAPV_, VTiles_,
+                       TiledMMAQK_, TiledMMAPV_, VTiles_, HeadDimQK_,
                        TensorQ_, TensorK_, TensorV_,
                        TensorK_cache_, TensorV_cache_,
                        TiledCopyQ_, TiledCopyK_, TiledCopyV_,
@@ -96,8 +99,13 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   using TileShapeQK = decltype(TiledMMAQK{}.tile_mnk());
   using TileShapePV = decltype(TiledMMAPV{}.tile_mnk());
   static constexpr int VTiles = VTiles_;
+  static constexpr int HeadDimQK = HeadDimQK_;
+  static constexpr int QKTileDepth = int(get<2>(TileShapeQK{}));
+  static constexpr int QTilesPerHead = (HeadDimQK + QKTileDepth - 1) / QKTileDepth;
   using SubgroupLayoutQK = decltype(TiledMMAQK{}.get_atom_layout_mnk());
   using SGPerWG = decltype(product(take<1,4>(shape(typename TiledMMAQK::ThrLayoutVMNK{}))));
+
+  static_assert(HeadDimQK > 0, "HeadDimQK must be provided for Q SLM staging.");
 
   using TensorQ = TensorQ_;
   using TensorK = TensorK_;
@@ -116,6 +124,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   using TensorV_cache2D = decltype(TensorV_cache_{}(append<rank_v<TensorV_cache_>>(make_coord(_,_),0)));
   using TiledCopyK_cache = conditional_t<is_void_v<TiledCopyK_cache_>, decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK_cache2D{})), TiledCopyK_cache_>;
   using TiledCopyV_cache = conditional_t<is_void_v<TiledCopyV_cache_>, decltype(make_block_2d_copy_B(TiledMMAPV{}, TensorV_cache2D{})), TiledCopyV_cache_>;
+  using QSLMCopies = decltype(make_A_slm_copies(TiledMMAQK{}, TiledCopyQ{TensorQ2D{}}));
+  using QSLMR2S = std::tuple_element_t<0, QSLMCopies>;
+  using QSLMLayout = decltype(make_layout(append<3>(typename QSLMR2S::Tiler_MN{}, Int<QTilesPerHead>{})));
 
   // TODO: static_asserts on TiledMMAPV here...
 
@@ -158,15 +169,22 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   using Params = Arguments;
 
   // SLM data
-  struct SharedStorage {};
+  struct SharedStorage {
+    cute::array<typename TiledMMAQK::ValTypeA, size(QSLMLayout{})> q_data;
+  };
 
   Params params;
+
+private:
+  SharedStorage &shared;
+
+public:
 
   //
   // Methods
   //
 
-  FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloop(Params const& params_, SharedStorage& shared_) : params(params_), shared(shared_) {}
 
   static constexpr
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
@@ -256,13 +274,22 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     /* Create MMAs */
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
+    auto copy_q_mma = make_block_2d_copy_A(
+      mma_qk,
+      make_tensor(make_gmem_ptr(static_cast<typename TiledMMAQK::ValTypeA const*>(nullptr)),
+            make_layout(shape(Q_2D), stride(Q_2D))));
+    auto [r2s_q, s2r_q] = make_A_slm_copies(mma_qk, copy_q);
+    Tensor sQ = make_tensor(make_smem_ptr<typename TiledMMAQK::ValTypeA>(&shared.q_data), QSLMLayout{});
 
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
     auto thr_copy_q = copy_q.get_slice(thr_id);
+    auto thr_copy_q_mma = copy_q_mma.get_slice(thr_id);
     auto thr_copy_k = copy_k.get_slice(thr_id);
     auto thr_copy_v = copy_v.get_slice(thr_id);
     auto thr_copy_k_cache = copy_k_cache.get_slice(thr_id);
     auto thr_copy_v_cache = copy_v_cache.get_slice(thr_id);
+    auto thr_r2s_q = r2s_q.get_slice(thr_id);
+    auto thr_s2r_q = s2r_q.get_slice(thr_id);
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
 
@@ -275,7 +302,12 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
 
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
+    auto tQrQ_mma = thr_copy_q_mma.partition_sg_fragment_D(gQ(_,_,0));
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
+    auto tQsQ = thr_r2s_q.partition_D(sQ);
+    auto tQrQsQ = thr_r2s_q.retile_S(tQrQ_mma);
+    auto tSsQ = thr_s2r_q.partition_S(sQ);
+    auto tSrQsQ = thr_s2r_q.retile_D(tSrQ);
 
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
@@ -287,14 +319,12 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     auto tArV = thr_mma_pv.partition_sg_fragment_B(gV_split(_,_,0,0));
 
     /* Create TiledCopy objects for prefetches */
-    auto prefetch_q = make_block_2d_prefetch(copy_q);
     auto prefetch_k = make_block_2d_prefetch(copy_k);
     auto prefetch_v = make_block_2d_prefetch(copy_v);
     auto prefetch_k_cache = make_block_2d_prefetch(copy_k_cache);
     auto prefetch_v_cache = make_block_2d_prefetch(copy_v_cache);
 
     /* Partition global tensors for prefetch */
-    auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
     auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
     auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
@@ -304,11 +334,14 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     // Kernel
     // ------
 
-    /* Initialization steps for first block: Q/K prefetch, O init */
+    /* Initialization steps for first block: Q staging, K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
-    for (int D = 0; D < size<3>(pQgQ); D++) {
-      prefetch(prefetch_q, pQgQ(_,_,_,D));
+    // barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+    for (int D = 0; D < size<3>(tQgQ); D++) {
+      copy(copy_q, tQgQ(_,_,_,D), tQrQ);
+      reorder(tQrQ, tQrQ_mma);
+      copy(r2s_q, tQrQsQ, tQsQ(_,_,_,D));
     }
     for (int D = 0; D < size<4>(pKgK); D++) {
       CUTLASS_PRAGMA_UNROLL
@@ -333,7 +366,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
 
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
-
+    
+    // barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
     /* Main loop body */
     auto mainloop_body = [&](auto cached_k, int K,
                             auto& copy_k_cur, auto& copy_v_cur,
@@ -357,9 +391,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_q, tQgQ(_,_,_,D), tQrQ);
+        copy(s2r_q, tSsQ(_,_,_,D), tSrQsQ);
         copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
-        reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
 
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);

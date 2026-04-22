@@ -1,0 +1,24 @@
+main
+(sgl-xpu) sunjiwei@ai006:~/code/sycl-tla/build$ ./examples/06_bmg_flash_attention/06_xe_fmha_fwd_prefill_bfloat16_t_hdim128 
+Disposition: Passed
+Batch: 16       NumHeads_q: 32  NumHeads_kv: 4  Seq Length QO: 4096     Seq Length KV: 4096     Head Size QK: 128       Head Size VO: 128       Causal Mask: false      Variable Sequence Length: false  Scheduler: Individual
+Performance:   35.480  GB/s,    89.431  TFlop/s,   49.1783  ms
+
+(sgl-xpu) sunjiwei@ai006:~/code/sycl-tla/build$ ./examples/06_bmg_flash_attention/06_xe_fmha_fwd_prefill_bfloat16_t_hdim128 --seq_len_qo=1
+Disposition: Passed
+Batch: 16       NumHeads_q: 32  NumHeads_kv: 4  Seq Length QO: 1        Seq Length KV: 4096     Head Size QK: 128       Head Size VO: 128       Causal Mask: false      Variable Sequence Length: false  Scheduler: Individual
+Performance:   35.829  GB/s,    0.286  TFlop/s,   3.7570  ms
+
+
+
+==============================================================================================================================================================================================================================
+GQA with SLM
+(sgl-xpu) sunjiwei@ai006:~/code/sycl-tla/build$ ./examples/06_bmg_flash_attention/06_xe_fmha_fwd_prefill_bfloat16_t_hdim128 
+Disposition: Passed
+Batch: 16       NumHeads_q: 32  NumHeads_kv: 4  Seq Length QO: 4096     Seq Length KV: 4096     Head Size QK: 128       Head Size VO: 128       Causal Mask: false      Variable Sequence Length: false  Scheduler: Individual
+Performance:   28.584  GB/s,    72.050  TFlop/s,   61.0417  ms
+
+(sgl-xpu) sunjiwei@ai006:~/code/sycl-tla/build$ ./examples/06_bmg_flash_attention/06_xe_fmha_fwd_prefill_bfloat16_t_hdim128  --seq_len_qo=1
+Disposition: Passed
+Batch: 16       NumHeads_q: 32  NumHeads_kv: 4  Seq Length QO: 1        Seq Length KV: 4096     Head Size QK: 128       Head Size VO: 128       Causal Mask: false      Variable Sequence Length: false  Scheduler: Individual
+Performance:   35.528  GB/s,    0.283  TFlop/s,   3.7889  ms

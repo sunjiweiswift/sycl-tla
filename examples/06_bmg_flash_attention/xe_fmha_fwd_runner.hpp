@@ -60,7 +60,7 @@ struct Options {
   bool error;
   bool is_causal;
   bool varlen = false;
-  bool use_paged_kv = false;
+  bool use_paged_kv = true;
   std::string scheduler;
 
   int batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, page_size, head_size_qk, head_size_vo, iterations, warmup, verify;
@@ -95,10 +95,10 @@ struct Options {
     cmd.get_cmd_line_argument("num_heads_kv", num_heads_kv, 1);
     cmd.get_cmd_line_argument("seq_len_kv", seq_len_kv, 4096);
 #else
-    cmd.get_cmd_line_argument("batch", batch, 32);
-    cmd.get_cmd_line_argument("num_heads_q", num_heads_q, 16);
-    cmd.get_cmd_line_argument("num_heads_kv", num_heads_kv, num_heads_q);
-    cmd.get_cmd_line_argument("seq_len_kv", seq_len_kv, 512);
+    cmd.get_cmd_line_argument("batch", batch, 16);
+    cmd.get_cmd_line_argument("num_heads_q", num_heads_q, 32);
+    cmd.get_cmd_line_argument("num_heads_kv", num_heads_kv, 4);
+    cmd.get_cmd_line_argument("seq_len_kv", seq_len_kv, 4096);
     cmd.get_cmd_line_argument("seq_len_kv_cache", seq_len_kv_cache, 0);
 #endif
 #ifdef DECODE
@@ -926,7 +926,7 @@ struct FMHAConfig {
     using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
     using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
         MainloopDispatchPolicy, Causal, CachedKV, PagedKV,
-        TiledMMAQK, TiledMMAPV, VTiles,
+      TiledMMAQK, TiledMMAPV, VTiles, HEAD_DIM,
         TensorQ, TensorK, TensorV,
         TensorK_cache, TensorV_cache,
         GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV,

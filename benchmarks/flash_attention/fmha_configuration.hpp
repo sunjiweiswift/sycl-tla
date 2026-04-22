@@ -109,7 +109,7 @@ struct FMHAConfig {
   using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
   using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
       MainloopDispatchPolicy, Causal, CachedKV, PagedKV,
-      TiledMMAQK, TiledMMAPV, VTiles,
+      TiledMMAQK, TiledMMAPV, VTiles, HeadDim,
       TensorQ, TensorK, TensorV,
       TensorK_cache, TensorV_cache,
       GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV,
