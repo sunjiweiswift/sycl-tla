@@ -40,6 +40,13 @@
 
 namespace cutlass::fmha::kernel {
 
+struct XeFMHATileSchedulerTask {
+  int blk_q = 0;
+  int blk_v = 0;
+  int batch_head = 0;
+  int packed_count = 1;
+};
+
 struct XeFHMAIndividualTileScheduler {
 
   struct Params {
@@ -88,6 +95,69 @@ struct XeFHMAIndividualTileScheduler {
   CUTLASS_DEVICE
   XeFHMAIndividualTileScheduler& operator++() {
     valid_ = false;
+    return *this;
+  }
+};
+
+struct XeFMHAChunkPrefillPersistentTileScheduler {
+
+  struct Params {
+    XeFMHATileSchedulerTask const* tasks = nullptr;
+    int num_tasks = 0;
+    int num_persistent_wgs = 0;
+    FastDivmod divmod_num_heads;
+  };
+
+  bool valid_ = true;
+  Params params;
+  int task_idx_ = 0;
+  int packed_offset_ = 0;
+
+  CUTLASS_DEVICE
+  XeFMHAChunkPrefillPersistentTileScheduler(Params const& params)
+      : valid_(BlockIdxX() < params.num_tasks), params(params), task_idx_(BlockIdxX()) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape, KernelHardwareInfo hw_info,
+      TileShape const& tile_shape)
+  {
+    int num_persistent_wgs = cute::min(shape.scheduler_num_tasks, hw_info.sm_count);
+    return Params{shape.scheduler_tasks, shape.scheduler_num_tasks, num_persistent_wgs, {shape.num_heads_q}};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return dim3(params.num_persistent_wgs, 1, 1);
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    auto task = params.tasks[task_idx_];
+    int batch_head = task.batch_head + packed_offset_;
+    int idx_b;
+    int head;
+    params.divmod_num_heads(idx_b, head, batch_head);
+    return make_coord(task.blk_q, task.blk_v, head, idx_b);
+  }
+
+  CUTLASS_DEVICE
+  XeFMHAChunkPrefillPersistentTileScheduler& operator++() {
+    auto task = params.tasks[task_idx_];
+    ++packed_offset_;
+    if (packed_offset_ < task.packed_count) {
+      return *this;
+    }
+
+    packed_offset_ = 0;
+    task_idx_ += GridDimX();
+    valid_ = task_idx_ < params.num_tasks;
     return *this;
   }
 };

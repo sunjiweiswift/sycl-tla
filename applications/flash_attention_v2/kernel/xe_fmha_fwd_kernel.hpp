@@ -54,6 +54,8 @@ struct FMHAProblemShape {
   int num_heads_q, num_heads_kv;
   SeqLenType seq_len_qo, seq_len_kv, seq_len_kv_cache;
   int head_size_qk, head_size_vo;
+  XeFMHATileSchedulerTask const* scheduler_tasks = nullptr;
+  int scheduler_num_tasks = 0;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
