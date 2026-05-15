@@ -61,13 +61,14 @@ struct Options {
   bool is_causal;
   bool varlen = false;
   bool use_paged_kv = false;
+  bool chunkprefill_mixed = false;
   std::string scheduler;
 
   int batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, page_size, head_size_qk, head_size_vo, iterations, warmup, verify;
   float softmax_scale;
 
   Options()
-      : help(false), error(false), is_causal(false), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
+      : help(false), error(false), is_causal(false), varlen(false), use_paged_kv(false), chunkprefill_mixed(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
         seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), scheduler("Individual") {}
 
   // Parses the command line
@@ -84,6 +85,11 @@ struct Options {
     }
 
     if (cmd.check_cmd_line_flag("varlen")) {
+      varlen = true;
+    }
+
+    if (cmd.check_cmd_line_flag("chunkprefill_mixed")) {
+      chunkprefill_mixed = true;
       varlen = true;
     }
 
@@ -137,7 +143,8 @@ struct Options {
         << "  --help                      If specified, displays this usage statement\n\n"
         << "  --is_causal                 Apply Causal Mask to the output of first Matmul\n"
         << "  --varlen                    Enable variable sequence length\n"
-        << "  --scheduler=\"Value\"       Choose between Individual or Persistent Scheduler\n"
+        << "  --chunkprefill_mixed        Enable deterministic mixed decode/prefill variable sequence lengths\n"
+        << "  --scheduler=\"Value\"       Choose between Individual, ChunkPrefillPersistent, or Persistent Scheduler\n"
         << "  --batch=<int>               Sets the Batch Size of the Multi-Head Self Attention module\n"
         << "  --num_heads_q=<int>         Sets the Number of Attention Heads for Key-Value pair the Multi-Head Self Attention module\n"
         << "  --num_heads_kv=<int>        Sets the Number of Attention Heads for Query input in the Multi-Head Self Attention module\n"
@@ -225,6 +232,8 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   cutlass::DeviceAllocation<ElementV> block_V_cache;
   cutlass::DeviceAllocation<ElementO> block_O;
   cutlass::DeviceAllocation<ElementO> block_ref_O;
+  cutlass::DeviceAllocation<int> scheduler_prefill_offsets;
+  cutlass::DeviceAllocation<int> scheduler_decode_offsets;
 
   std::vector<int> cumulative_seqlen_q;
   std::vector<int> cumulative_seqlen_kv;
@@ -240,12 +249,63 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   };
   PagedKVParams paged_kv_cache;
 
+  void initialize_chunkprefill_schedule(ProblemShapeType& shape, const Options& options) {
+    int num_v_blocks = cute::ceil_div(options.head_size_vo, get<1>(typename FMHAKernel::TileShapeO{}));
+    int tile_q = get<0>(typename FMHAKernel::TileShapeO{});
+
+    std::vector<int> prefill_offsets;
+    std::vector<int> decode_offsets;
+    prefill_offsets.reserve(options.batch + 1);
+    decode_offsets.reserve(options.batch + 1);
+    prefill_offsets.push_back(0);
+    decode_offsets.push_back(0);
+
+    for (int b = 0; b < options.batch; ++b) {
+      int seq_len_qo = options.seq_len_qo;
+      if constexpr (isVarLen) {
+        seq_len_qo = cumulative_seqlen_q[b + 1] - cumulative_seqlen_q[b];
+      }
+
+      int prefill_tasks = seq_len_qo > 1 ? options.num_heads_q * cute::ceil_div(seq_len_qo, tile_q) : 0;
+      int decode_batch_heads = seq_len_qo == 1 ? options.num_heads_q : 0;
+      prefill_offsets.push_back(prefill_offsets.back() + prefill_tasks);
+      decode_offsets.push_back(decode_offsets.back() + decode_batch_heads);
+    }
+
+    int prefill_tasks_per_v = prefill_offsets.back();
+    int decode_tasks_per_v = decode_offsets.back();
+    int tasks_per_v = prefill_tasks_per_v + decode_tasks_per_v;
+
+    scheduler_prefill_offsets.reset(prefill_offsets.size());
+    scheduler_prefill_offsets.copy_from_host(prefill_offsets.data(), prefill_offsets.size());
+    scheduler_decode_offsets.reset(decode_offsets.size());
+    scheduler_decode_offsets.copy_from_host(decode_offsets.data(), decode_offsets.size());
+
+    shape.scheduler_num_tasks = num_v_blocks * tasks_per_v;
+    shape.scheduler_prefill_offsets = scheduler_prefill_offsets.get();
+    shape.scheduler_decode_offsets = scheduler_decode_offsets.get();
+    shape.scheduler_prefill_tasks_per_v = prefill_tasks_per_v;
+    shape.scheduler_tasks_per_v = tasks_per_v;
+  }
+
+  void print_seq_len_q_per_batch(ProblemShapeType const& shape) const {
+    std::cout << "seq_len_q per batch:";
+    for (int b = 0; b < shape.batch; ++b) {
+      int seq_len_qo = shape.seq_len_qo;
+      if constexpr (isVarLen) {
+        seq_len_qo = cumulative_seqlen_q[b + 1] - cumulative_seqlen_q[b];
+      }
+      std::cout << " [" << b << "]=" << seq_len_qo;
+    }
+    std::cout << std::endl;
+  }
+
   //
   // Methods
   //
 
   template<class ProblemShape>
-  auto initialize_varlen(const ProblemShape& problem_size) {
+  auto initialize_varlen(const ProblemShape& problem_size, const Options& options) {
     int num_batches = get<0>(problem_size);
 
     // generate Q as --b times
@@ -281,8 +341,10 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     int max_seqlen_kv_cache = 0;
 
     for (int i = 0; i < num_batches; i++) {
-      int seqlen_q = cutlass::round_up(generate_positive_int(dist_q, rng), AlignmentQ);
-      int seqlen_kv = cutlass::round_up(generate_positive_int(dist_kv, rng), AlignmentKV);
+      int seqlen_q = options.chunkprefill_mixed
+          ? ((i % 2 == 0) ? 1 : get<3>(problem_size))
+          : cutlass::round_up(generate_positive_int(dist_q, rng), AlignmentQ);
+      int seqlen_kv = options.chunkprefill_mixed ? get<4>(problem_size) : cutlass::round_up(generate_positive_int(dist_kv, rng), AlignmentKV);
       int seqlen_kv_cache = get<5>(problem_size) == 0 ? 0 : cutlass::round_up(generate_positive_int(dist_kv_cache, rng), AlignmentKVCache);
 
       total_seqlen_q += seqlen_q;
@@ -593,7 +655,7 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     decltype(problem_shape_in) problem_size;
 
     if constexpr (isVarLen) {
-      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(problem_shape_in);
+      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(problem_shape_in, options);
       problem_size = problem_shape_init;
       shape = problem_shape_launch;
     } else {
@@ -689,6 +751,9 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       shape.seq_len_kv.cumulative_length = device_cumulative_seqlen_kv.get();
       shape.seq_len_kv_cache.cumulative_length = device_cumulative_seqlen_kv_cache.get();
     }
+    if (options.scheduler == "ChunkPrefillPersistent") {
+      initialize_chunkprefill_schedule(shape, options);
+    }
     return shape;
   }
 
@@ -728,6 +793,10 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   cutlass::Status run(const Options &options, const cutlass::KernelHardwareInfo &hw_info) {
 
     ProblemShapeType shape = initialize(options);
+
+    if (options.varlen) {
+      print_seq_len_q_per_batch(shape);
+    }
 
     typename FMHAKernel::Arguments arguments{
       {
@@ -967,6 +1036,20 @@ struct FMHAConfig {
         return -1;
       }
       return run<false, false, false, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>(options);
+    } else if (options.scheduler == "ChunkPrefillPersistent") {
+      if (options.use_paged_kv && !options.varlen) {
+        return run<false, true, true, cutlass::fmha::kernel::XeFMHAChunkPrefillPersistentTileScheduler>(options);
+      } else if(!options.use_paged_kv && options.varlen && !cached_kv) {
+        return run<true, false, false, cutlass::fmha::kernel::XeFMHAChunkPrefillPersistentTileScheduler>(options);
+      } else if(!options.use_paged_kv && !options.varlen && !cached_kv) {
+        return run<false, false, false, cutlass::fmha::kernel::XeFMHAChunkPrefillPersistentTileScheduler>(options);
+      } else if (!options.use_paged_kv && options.varlen && cached_kv) {
+        return run<true, true, false, cutlass::fmha::kernel::XeFMHAChunkPrefillPersistentTileScheduler>(options);
+      } else if (!options.use_paged_kv && !options.varlen && cached_kv) {
+        return run<false, true, false, cutlass::fmha::kernel::XeFMHAChunkPrefillPersistentTileScheduler>(options);
+      } else {
+        return run<true, true, true, cutlass::fmha::kernel::XeFMHAChunkPrefillPersistentTileScheduler>(options);
+      }
     } else if (options.use_paged_kv && !options.varlen) {
       return run<false, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else if(!options.use_paged_kv && options.varlen && !cached_kv) {
