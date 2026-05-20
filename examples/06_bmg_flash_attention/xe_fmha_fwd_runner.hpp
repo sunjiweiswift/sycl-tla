@@ -36,6 +36,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "flash_attention_v2/collective/fmha_fusion.hpp"
 #include "flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
+#include "flash_attention_v2/kernel/xe_reduce_split_k.h"
 #include "flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/sycl_event_manager.hpp"
@@ -61,14 +62,16 @@ struct Options {
   bool is_causal;
   bool varlen = false;
   bool use_paged_kv = false;
+  bool chunkprefill = false;
   std::string scheduler;
 
-  int batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, page_size, head_size_qk, head_size_vo, iterations, warmup, verify;
+  int batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, page_size, head_size_qk, head_size_vo, iterations, warmup, verify, num_kv_splits, chunkprefill_seq_qo_1_ratio;
   float softmax_scale;
 
   Options()
-      : help(false), error(false), is_causal(false), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
-        seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), scheduler("Individual") {}
+      : help(false), error(false), is_causal(false), varlen(false), use_paged_kv(false), chunkprefill(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
+        seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), num_kv_splits(2),
+        chunkprefill_seq_qo_1_ratio(50), scheduler("Individual") {}
 
   // Parses the command line
   void parse(int argc, char const **args) {
@@ -87,7 +90,17 @@ struct Options {
       varlen = true;
     }
 
+    if (cmd.check_cmd_line_flag("chunkprefill")) {
+      chunkprefill = true;
+      varlen = true;
+    }
+
     cmd.get_cmd_line_argument("scheduler", scheduler, std::string("Individual"));
+
+    if (scheduler == "ChunkPrefillStaticPresistent" || scheduler == "ChunkprefillDynamicpresistent" ||
+        scheduler == "ChunkPrefillSplitKVStaticPersistent" || scheduler == "ChunkPrefillSplitKVDynamicPersistent") {
+      varlen = true;
+    }
 
 #ifdef PERSISTENT
     cmd.get_cmd_line_argument("batch", batch, 1);
@@ -111,6 +124,14 @@ struct Options {
     cmd.get_cmd_line_argument("iterations", iterations, 100);
     cmd.get_cmd_line_argument("warmup", warmup, 100);
     cmd.get_cmd_line_argument("verify", verify, 1);
+    cmd.get_cmd_line_argument("num_kv_splits", num_kv_splits, 2);
+    cmd.get_cmd_line_argument("chunkprefill_seq_qo_1_ratio", chunkprefill_seq_qo_1_ratio, 50);
+
+    if (chunkprefill_seq_qo_1_ratio < 0 || chunkprefill_seq_qo_1_ratio > 100) {
+      std::cerr << "Invalid: chunkprefill_seq_qo_1_ratio must be in [0, 100]" << std::endl;
+      error = true;
+      return;
+    }
 
     if (cmd.check_cmd_line_flag("use_paged_kv")) {
         use_paged_kv = true;
@@ -137,7 +158,10 @@ struct Options {
         << "  --help                      If specified, displays this usage statement\n\n"
         << "  --is_causal                 Apply Causal Mask to the output of first Matmul\n"
         << "  --varlen                    Enable variable sequence length\n"
-        << "  --scheduler=\"Value\"       Choose between Individual or Persistent Scheduler\n"
+        << "  --chunkprefill              For varlen, use seq_len_qo 1 for part of batch and --seq_len_qo for the rest\n"
+        << "  --chunkprefill_seq_qo_1_ratio=<int>  Percent of chunkprefill batch entries with seq_len_qo=1. Default is 50\n"
+        << "  --scheduler=\"Value\"       Choose between Individual, Persistent, ChunkPrefillStaticPresistent, ChunkprefillDynamicpresistent, ChunkPrefillSplitKVStaticPersistent, or ChunkPrefillSplitKVDynamicPersistent Scheduler\n"
+        << "  --num_kv_splits=<int>       Number of KV splits for splitKV persistent schedulers\n"
         << "  --batch=<int>               Sets the Batch Size of the Multi-Head Self Attention module\n"
         << "  --num_heads_q=<int>         Sets the Number of Attention Heads for Key-Value pair the Multi-Head Self Attention module\n"
         << "  --num_heads_kv=<int>        Sets the Number of Attention Heads for Query input in the Multi-Head Self Attention module\n"
@@ -202,8 +226,16 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
 
   using CollectiveMainloop = typename FMHAKernel::CollectiveMainloop;
   using ElementS = typename CollectiveMainloop::ElementS;
+  using TileShapeQK = typename FMHAKernel::TileShapeQK;
+  using TileShapeO = typename FMHAKernel::TileShapeO;
 
   using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
+  using TileScheduler = typename FMHAKernel::TileScheduler;
+  static constexpr bool is_static_persistent_scheduler = is_same_v<TileScheduler, cutlass::fmha::kernel::XeFHMAStaticPresistentTileScheduler>;
+  static constexpr bool is_dynamic_persistent_scheduler = is_same_v<TileScheduler, cutlass::fmha::kernel::XeFHMADynamicPresistentTileScheduler>;
+  static constexpr bool is_split_kv_scheduler = is_same_v<TileScheduler, cutlass::fmha::kernel::XeFMHASplitKVStaticPersistentTileScheduler> ||
+                                                is_same_v<TileScheduler, cutlass::fmha::kernel::XeFMHASplitKVDynamicPersistentTileScheduler>;
+  static constexpr bool uses_block_prefix = is_static_persistent_scheduler || is_dynamic_persistent_scheduler || is_split_kv_scheduler;
 
   //
   // Data members
@@ -227,9 +259,15 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   cutlass::DeviceAllocation<ElementO> block_ref_O;
 
   std::vector<int> cumulative_seqlen_q;
+  std::vector<int> cumulative_q_blocks;
+  std::vector<int> cumulative_k_blocks;
+  std::vector<int> cumulative_split_kv_blocks;
   std::vector<int> cumulative_seqlen_kv;
   std::vector<int> cumulative_seqlen_kv_cache;
   cutlass::DeviceAllocation<int> device_cumulative_seqlen_q;
+  cutlass::DeviceAllocation<int> device_cumulative_q_blocks;
+  cutlass::DeviceAllocation<int> device_cumulative_k_blocks;
+  cutlass::DeviceAllocation<int> device_cumulative_split_kv_blocks;
   cutlass::DeviceAllocation<int> device_cumulative_seqlen_kv;
   cutlass::DeviceAllocation<int> device_cumulative_seqlen_kv_cache;
 
@@ -245,7 +283,7 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   //
 
   template<class ProblemShape>
-  auto initialize_varlen(const ProblemShape& problem_size) {
+  auto initialize_varlen(const ProblemShape& problem_size, const Options& options) {
     int num_batches = get<0>(problem_size);
 
     // generate Q as --b times
@@ -270,30 +308,54 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     };
 
     cumulative_seqlen_q = {0};
+    cumulative_q_blocks = {0};
+    cumulative_k_blocks = {0};
+    cumulative_split_kv_blocks = {0};
     cumulative_seqlen_kv = {0};
     cumulative_seqlen_kv_cache = {0};
 
     int total_seqlen_q = 0;
     int total_seqlen_kv = 0;
     int total_seqlen_kv_cache = 0;
+    int total_q_blocks = 0;
+    int total_k_blocks = 0;
+    int total_split_kv_blocks = 0;
     int max_seqlen_q = 0;
     int max_seqlen_kv = 0;
     int max_seqlen_kv_cache = 0;
 
+    int const num_seq_qo_1_batches = num_batches * options.chunkprefill_seq_qo_1_ratio / 100;
+
     for (int i = 0; i < num_batches; i++) {
-      int seqlen_q = cutlass::round_up(generate_positive_int(dist_q, rng), AlignmentQ);
-      int seqlen_kv = cutlass::round_up(generate_positive_int(dist_kv, rng), AlignmentKV);
-      int seqlen_kv_cache = get<5>(problem_size) == 0 ? 0 : cutlass::round_up(generate_positive_int(dist_kv_cache, rng), AlignmentKVCache);
+      int seqlen_q = options.chunkprefill
+        ? ((i < num_seq_qo_1_batches) ? 1 : get<3>(problem_size))
+        : cutlass::round_up(generate_positive_int(dist_q, rng), AlignmentQ);
+      int seqlen_kv = options.chunkprefill
+        ? get<4>(problem_size)
+        : cutlass::round_up(generate_positive_int(dist_kv, rng), AlignmentKV);
+      int seqlen_kv_cache = get<5>(problem_size) == 0 ? 0 : (options.chunkprefill
+        ? get<5>(problem_size)
+        : cutlass::round_up(generate_positive_int(dist_kv_cache, rng), AlignmentKVCache));
 
       total_seqlen_q += seqlen_q;
       total_seqlen_kv += seqlen_kv;
       total_seqlen_kv_cache += seqlen_kv_cache;
+      int q_blocks = cute::ceil_div(seqlen_q, int(get<0>(TileShapeO{})));
+      int k_blocks = cute::ceil_div(seqlen_kv + seqlen_kv_cache, int(get<1>(TileShapeQK{})));
+      int split_k_blocks = cute::min(k_blocks, options.num_kv_splits);
+      int split_kv_blocks = q_blocks * split_k_blocks;
+      total_q_blocks += q_blocks;
+      total_k_blocks += split_k_blocks;
+      total_split_kv_blocks += split_kv_blocks;
 
       max_seqlen_q = std::max(max_seqlen_q, seqlen_q);
       max_seqlen_kv = std::max(max_seqlen_kv, seqlen_kv);
       max_seqlen_kv_cache = std::max(max_seqlen_kv_cache, seqlen_kv_cache);
 
       cumulative_seqlen_q.push_back(cumulative_seqlen_q.back() + seqlen_q);
+      cumulative_q_blocks.push_back(cumulative_q_blocks.back() + q_blocks);
+      cumulative_k_blocks.push_back(cumulative_k_blocks.back() + split_k_blocks);
+      cumulative_split_kv_blocks.push_back(cumulative_split_kv_blocks.back() + split_kv_blocks);
       cumulative_seqlen_kv.push_back(cumulative_seqlen_kv.back() + seqlen_kv);
       cumulative_seqlen_kv_cache.push_back(cumulative_seqlen_kv_cache.back() + seqlen_kv_cache);
     }
@@ -308,8 +370,9 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     problem_size_for_launch.batch = get<0>(problem_size);
     problem_size_for_launch.num_heads_q = get<1>(problem_size);
     problem_size_for_launch.num_heads_kv = get<2>(problem_size);
-    problem_size_for_launch.seq_len_qo = cutlass::fmha::collective::VariableLength{max_seqlen_q};
-    problem_size_for_launch.seq_len_kv = cutlass::fmha::collective::VariableLength{max_seqlen_kv};
+    problem_size_for_launch.seq_len_qo = cutlass::fmha::collective::VariableLength{max_seqlen_q, nullptr, total_q_blocks};
+    problem_size_for_launch.seq_len_kv = cutlass::fmha::collective::VariableLength{max_seqlen_kv, nullptr, total_k_blocks};
+    problem_size_for_launch.seq_len_kv.total_split_kv_blocks = total_split_kv_blocks;
     problem_size_for_launch.seq_len_kv_cache = cutlass::fmha::collective::VariableLength{max_seqlen_kv_cache};
     problem_size_for_launch.head_size_qk = get<6>(problem_size);
     problem_size_for_launch.head_size_vo = get<7>(problem_size);
@@ -593,7 +656,7 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     decltype(problem_shape_in) problem_size;
 
     if constexpr (isVarLen) {
-      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(problem_shape_in);
+      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(problem_shape_in, options);
       problem_size = problem_shape_init;
       shape = problem_shape_launch;
     } else {
@@ -674,6 +737,21 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       device_cumulative_seqlen_q.copy_from_host(cumulative_seqlen_q.data(), cumulative_seqlen_q.size());
     }
 
+    if (!cumulative_q_blocks.empty()) {
+      device_cumulative_q_blocks.reset(cumulative_q_blocks.size());
+      device_cumulative_q_blocks.copy_from_host(cumulative_q_blocks.data(), cumulative_q_blocks.size());
+    }
+
+    if (!cumulative_k_blocks.empty()) {
+      device_cumulative_k_blocks.reset(cumulative_k_blocks.size());
+      device_cumulative_k_blocks.copy_from_host(cumulative_k_blocks.data(), cumulative_k_blocks.size());
+    }
+
+    if (!cumulative_split_kv_blocks.empty()) {
+      device_cumulative_split_kv_blocks.reset(cumulative_split_kv_blocks.size());
+      device_cumulative_split_kv_blocks.copy_from_host(cumulative_split_kv_blocks.data(), cumulative_split_kv_blocks.size());
+    }
+
     if (!cumulative_seqlen_kv.empty()) {
       device_cumulative_seqlen_kv.reset(cumulative_seqlen_kv.size());
       device_cumulative_seqlen_kv.copy_from_host(cumulative_seqlen_kv.data(), cumulative_seqlen_kv.size());
@@ -688,6 +766,15 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       shape.seq_len_qo.cumulative_length = device_cumulative_seqlen_q.get();
       shape.seq_len_kv.cumulative_length = device_cumulative_seqlen_kv.get();
       shape.seq_len_kv_cache.cumulative_length = device_cumulative_seqlen_kv_cache.get();
+
+      if constexpr (uses_block_prefix) {
+        shape.seq_len_qo.cumulative_blocks = device_cumulative_q_blocks.get();
+      }
+
+      if constexpr (is_split_kv_scheduler) {
+        shape.seq_len_kv.cumulative_blocks = device_cumulative_k_blocks.get();
+        shape.seq_len_kv.cumulative_split_kv_blocks = device_cumulative_split_kv_blocks.get();
+      }
     }
     return shape;
   }
@@ -698,6 +785,8 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   {
     namespace syclex = sycl::ext::oneapi::experimental;
     namespace intelex = sycl::ext::intel::experimental;
+    constexpr bool is_split_kv = is_same_v<typename FMHAKernel::TileScheduler, cutlass::fmha::kernel::XeFMHASplitKVStaticPersistentTileScheduler> ||
+                                 is_same_v<typename FMHAKernel::TileScheduler, cutlass::fmha::kernel::XeFMHASplitKVDynamicPersistentTileScheduler>;
 
     dim3 const block = FMHAKernel::get_block_shape();
     dim3 const grid = FMHAKernel::get_grid_shape(params);
@@ -723,6 +812,56 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
 #else
     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel, false>(policy, params);
 #endif
+
+    if constexpr (is_split_kv) {
+      using ReduceKernel = cutlass::reduction::kernel::ReduceSplitK<
+          typename FMHAKernel::ProblemShape,
+          cutlass::fmha::kernel::XeReduceSplitKTileScheduler,
+          FMHAKernel>;
+
+      typename ReduceKernel::Arguments reduce_arguments{
+        {
+          params.kernel.shape,
+          params.kernel.O, params.kernel.dO,
+          params.kernel.Oaccum, params.kernel.dOaccum,
+          params.kernel.exp_sums, params.kernel.dExp_sums,
+          params.kernel.max_logits, params.kernel.dMax_logits,
+        },
+        {},
+        params.scheduler.num_kv_splits_
+      };
+      auto reduce_params = ReduceKernel::to_underlying_arguments(reduce_arguments, nullptr);
+
+      dim3 const reduce_block = ReduceKernel::get_block_shape();
+      dim3 const reduce_grid = ReduceKernel::get_grid_shape(reduce_params);
+      int reduce_smem_size = ReduceKernel::SharedStorageSize;
+
+      const auto reduce_sycl_block = compat::dim3(reduce_block.x, reduce_block.y, reduce_block.z);
+      const auto reduce_sycl_grid = compat::dim3(reduce_grid.x, reduce_grid.y, reduce_grid.z);
+
+      compat::experimental::launch_properties reduce_launch_props {
+        syclex::work_group_scratch_size(reduce_smem_size),
+      };
+      compat::experimental::kernel_properties reduce_kernel_props{
+        syclex::sub_group_size<cute::intel::sg_size>,
+        intelex::grf_size<256>
+      };
+      compat::experimental::launch_policy reduce_policy{reduce_sycl_grid, reduce_sycl_block, reduce_launch_props, reduce_kernel_props};
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+      auto reduce_event = compat::experimental::launch<cutlass::device_kernel<ReduceKernel>, ReduceKernel>(reduce_policy, reduce_params);
+      EventManager::getInstance().addEvent(reduce_event);
+#else
+      compat::experimental::launch<cutlass::device_kernel<ReduceKernel>, ReduceKernel, false>(reduce_policy, reduce_params);
+#endif
+    }
+  }
+
+  cutlass::Status initialize_workspace_for_run(typename FMHAKernel::Arguments const& arguments, uint8_t* workspace) {
+    if constexpr (is_same_v<typename FMHAKernel::TileScheduler, cutlass::fmha::kernel::XeFHMADynamicPresistentTileScheduler> ||
+                  is_same_v<typename FMHAKernel::TileScheduler, cutlass::fmha::kernel::XeFMHASplitKVDynamicPersistentTileScheduler>) {
+      return FMHAKernel::initialize_workspace(arguments, workspace);
+    }
+    return cutlass::Status::kSuccess;
   }
 
   cutlass::Status run(const Options &options, const cutlass::KernelHardwareInfo &hw_info) {
@@ -746,7 +885,8 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
         options.use_paged_kv ? paged_kv_cache.num_pages_per_seq.get() : nullptr
       },
       {},
-      hw_info
+      hw_info,
+      options.num_kv_splits
     };
 
     // Define device-global scratch memory
@@ -769,6 +909,7 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     // Run the GEMM
     // Warmup runs
     for (int i = 0; i < options.warmup; ++i) {
+      CUTLASS_CHECK(initialize_workspace_for_run(arguments, workspace.get()));
       run(params);
     }
     compat::wait();
@@ -788,6 +929,7 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       GPU_Clock timer;
       timer.start();
       for (int i = 0; i < options.iterations; ++i) {
+        CUTLASS_CHECK(initialize_workspace_for_run(arguments, workspace.get()));
         run(params);
       }
       compat::wait();
@@ -921,6 +1063,7 @@ struct FMHAConfig {
     using TensorK = decltype(make_dummy_tensor(ElementK{}, StrideK{}));
     using TensorV = decltype(make_dummy_tensor(ElementV{}, StrideV{}));
     using TensorO = decltype(make_dummy_tensor(ElementO{}, StrideO{}));
+    using TensorLSE = decltype(make_dummy_tensor(float{}, StrideO{}));
     using TensorK_cache = TensorK;
     using TensorV_cache = TensorV;
     using GmemTiledCopyK_cache = GmemTiledCopyK;
@@ -942,16 +1085,22 @@ struct FMHAConfig {
         CollectiveMainloop,
         TileShapeOutput,
         TensorO,
-        GmemTiledCopyO
+        GmemTiledCopyO,
+        TensorLSE
     >;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
-    using FMHAKernel = conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
+    static constexpr bool is_split_kv_scheduler = is_same_v<Scheduler, cutlass::fmha::kernel::XeFMHASplitKVStaticPersistentTileScheduler> ||
+                                                  is_same_v<Scheduler, cutlass::fmha::kernel::XeFMHASplitKVDynamicPersistentTileScheduler>;
+    using FMHAKernel = conditional_t<is_split_kv_scheduler,
+      cutlass::fmha::kernel::XeFMHAFwdSplitKVKernel<
+        ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
+      conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
       cutlass::fmha::kernel::XeFMHAFwdDynamicSplitKernel<
         ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
         cutlass::fmha::kernel::XeFMHAFwdKernel<
         ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>
-        >;
+        >>;
 
     ExampleRunner<FMHAKernel, isVarLen> runner;
 
@@ -970,6 +1119,18 @@ struct FMHAConfig {
     } else if (options.use_paged_kv && !options.varlen) {
       return run<false, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else if(!options.use_paged_kv && options.varlen && !cached_kv) {
+      if (options.scheduler == "ChunkPrefillStaticPresistent") {
+        return run<true, false, false, cutlass::fmha::kernel::XeFHMAStaticPresistentTileScheduler>(options);
+      }
+      if (options.scheduler == "ChunkprefillDynamicpresistent") {
+        return run<true, false, false, cutlass::fmha::kernel::XeFHMADynamicPresistentTileScheduler>(options);
+      }
+      if (options.scheduler == "ChunkPrefillSplitKVStaticPersistent") {
+        return run<true, false, false, cutlass::fmha::kernel::XeFMHASplitKVStaticPersistentTileScheduler>(options);
+      }
+      if (options.scheduler == "ChunkPrefillSplitKVDynamicPersistent") {
+        return run<true, false, false, cutlass::fmha::kernel::XeFMHASplitKVDynamicPersistentTileScheduler>(options);
+      }
       return run<true, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else if(!options.use_paged_kv && !options.varlen && !cached_kv) {
       return run<false, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
