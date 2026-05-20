@@ -40,6 +40,10 @@ using namespace cute;
 struct VariableLength {
   int max_length;
   int* cumulative_length = nullptr;
+  int total_blocks = 0;
+  int const* cumulative_blocks = nullptr;
+  int total_split_kv_blocks = 0;
+  int const* cumulative_split_kv_blocks = nullptr;
 
   CUTE_HOST_DEVICE operator int() const {
     return max_length;
@@ -89,7 +93,7 @@ struct is_integral<cutlass::fmha::collective::VariableLength> : true_type {};
 
 CUTE_HOST_DEVICE
 void print(cutlass::fmha::collective::VariableLength a) {
-  printf("Varlen<%d, %p>", a.max_length, a.cumulative_length);
+  printf("Varlen<%d, %d, %p>", a.max_length, a.total_blocks, a.cumulative_length);
 }
 
 }
